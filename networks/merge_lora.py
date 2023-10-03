@@ -180,7 +180,7 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
                 if concat_dim is not None:
                     org_rank = merged_sd[key].size()[concat_dim]
                     merged_rank = org_rank + lora_sd[key].size()[concat_dim]
-                    merged_sd[key] = torch.cat([merged_sd[key], lora_sd[key] * scale], dim=concat_dim) * math.sqrt((org_rank / merged_rank))
+                    merged_sd[key] = torch.cat([merged_sd[key], lora_sd[key] * scale], dim=concat_dim) * math.sqrt((merged_rank / org_rank))
                 else:
                     merged_sd[key] = merged_sd[key] + lora_sd[key] * scale
             else:
