@@ -42,117 +42,46 @@ def save_to_file(file_name, state_dict, dtype, metadata):
 
 def merge_lora_models(models, ratios, new_rank, new_conv_rank, device, merge_dtype):
     print(f"new rank: {new_rank}, new conv rank: {new_conv_rank}")
-    merged_sd = {}
     v2 = None
     base_model = None
+    all_keys = []
+    lora_sds = []
+
     for model, ratio in zip(models, ratios):
         print(f"loading: {model}")
         lora_sd, lora_metadata = load_state_dict(model, merge_dtype)
-
+        lora_sds.append(lora_sd)
         if lora_metadata is not None:
             if v2 is None:
                 v2 = lora_metadata.get(train_util.SS_METADATA_KEY_V2, None)  # return string
             if base_model is None:
                 base_model = lora_metadata.get(train_util.SS_METADATA_KEY_BASE_MODEL_VERSION, None)
 
-        # merge
-        print(f"merging...")
+        # get keys
         for key in tqdm(list(lora_sd.keys())):
-            if "lora_down" not in key:
-                continue
+            if "lora_down"  in key and key[: key.rfind(".lora_down")] not in all_keys:
+                all_keys.append(key[: key.rfind(".lora_down")])
 
-            lora_module_name = key[: key.rfind(".lora_down")]
-
-            down_weight = lora_sd[key]
-            network_dim = down_weight.size()[0]
-
-            up_weight = lora_sd[lora_module_name + ".lora_up.weight"]
-            alpha = lora_sd.get(lora_module_name + ".alpha", network_dim)
-
-            in_dim = down_weight.size()[1]
-            out_dim = up_weight.size()[0]
-            conv2d = len(down_weight.size()) == 4
-            kernel_size = None if not conv2d else down_weight.size()[2:4]
-            # print(lora_module_name, network_dim, alpha, in_dim, out_dim, kernel_size)
-
-            # make original weight if not exist
-            if lora_module_name not in merged_sd:
-                weight = torch.zeros((out_dim, in_dim, *kernel_size) if conv2d else (out_dim, in_dim), dtype=merge_dtype)
-                if device:
-                    weight = weight.to(device)
-            else:
-                weight = merged_sd[lora_module_name]
-
-            # merge to weight
-            if device:
-                up_weight = up_weight.to(device)
-                down_weight = down_weight.to(device)
-
-            # W <- W + U * D
-            scale = alpha / network_dim
-
-            if device:  # and isinstance(scale, torch.Tensor):
-                scale = scale.to(device)
-
-            if not conv2d:  # linear
-                weight = weight + ratio * (up_weight @ down_weight) * scale
-            elif kernel_size == (1, 1):
-                weight = (
-                    weight
-                    + ratio
-                    * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
-                    * scale
-                )
-            else:
-                conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-                weight = weight + ratio * conved * scale
-
-            merged_sd[lora_module_name] = weight
-
-    # extract from merged weights
+    # extract from weights
     print("extract new lora...")
     merged_lora_sd = {}
-    with torch.no_grad():
-        for lora_module_name, mat in tqdm(list(merged_sd.items())):
-            conv2d = len(mat.size()) == 4
-            kernel_size = None if not conv2d else mat.size()[2:4]
-            conv2d_3x3 = conv2d and kernel_size != (1, 1)
-            out_dim, in_dim = mat.size()[0:2]
-
-            if conv2d:
-                if conv2d_3x3:
-                    mat = mat.flatten(start_dim=1)
+    for key in tqdm(all_keys):
+        mat = None
+        for lora_sd, ratio in zip(lora_sds, ratios):
+            if key + ".lora_down.weight" in lora_sd:
+                with torch.no_grad():
+                    weight = calc_weight(lora_sd, ratio, key, device)
+                if mat is None:
+                    mat = weight
                 else:
-                    mat = mat.squeeze()
+                    mat += weight
 
-            module_new_rank = new_conv_rank if conv2d_3x3 else new_rank
-            module_new_rank = min(module_new_rank, in_dim, out_dim)  # LoRA rank cannot exceed the original dim
+        with torch.no_grad():
+            up_weight, down_weight, module_new_rank = calc_lora(mat, new_rank, new_conv_rank)
 
-            U, S, Vh = torch.linalg.svd(mat)
-
-            U = U[:, :module_new_rank]
-            S = S[:module_new_rank]
-            U = U @ torch.diag(S)
-
-            Vh = Vh[:module_new_rank, :]
-
-            dist = torch.cat([U.flatten(), Vh.flatten()])
-            hi_val = torch.quantile(dist, CLAMP_QUANTILE)
-            low_val = -hi_val
-
-            U = U.clamp(low_val, hi_val)
-            Vh = Vh.clamp(low_val, hi_val)
-
-            if conv2d:
-                U = U.reshape(out_dim, module_new_rank, 1, 1)
-                Vh = Vh.reshape(module_new_rank, in_dim, kernel_size[0], kernel_size[1])
-
-            up_weight = U
-            down_weight = Vh
-
-            merged_lora_sd[lora_module_name + ".lora_up.weight"] = up_weight.to("cpu").contiguous()
-            merged_lora_sd[lora_module_name + ".lora_down.weight"] = down_weight.to("cpu").contiguous()
-            merged_lora_sd[lora_module_name + ".alpha"] = torch.tensor(module_new_rank)
+            merged_lora_sd[key + ".lora_up.weight"] = up_weight.to("cpu").contiguous()
+            merged_lora_sd[key + ".lora_down.weight"] = down_weight.to("cpu").contiguous()
+            merged_lora_sd[key + ".alpha"] = torch.tensor(module_new_rank)
 
     # build minimum metadata
     dims = f"{new_rank}"
@@ -164,6 +93,76 @@ def merge_lora_models(models, ratios, new_rank, new_conv_rank, device, merge_dty
     metadata = train_util.build_minimum_network_metadata(v2, base_model, "networks.lora", dims, alphas, network_args)
 
     return merged_lora_sd, metadata, v2 == "True", base_model
+
+def calc_weight(lora_sd, ratio, key, device):
+
+    down_weight = lora_sd[key + ".lora_down.weight"]
+    network_dim = down_weight.size()[0]
+    up_weight = lora_sd[key + ".lora_up.weight"]
+    alpha = lora_sd.get(key + ".alpha", network_dim)
+
+    in_dim = down_weight.size()[1]
+    out_dim = up_weight.size()[0]
+    conv2d = len(down_weight.size()) == 4
+    kernel_size = None if not conv2d else down_weight.size()[2:4]
+
+    if device:
+        up_weight = up_weight.to(device)
+        down_weight = down_weight.to(device)
+
+    scale = alpha / network_dim
+
+    if device:
+        scale = scale.to(device)
+
+    # get weight from LoRA
+    weight = ratio * (up_weight.reshape(-1 , network_dim) @ down_weight.reshape(network_dim, -1)) * scale
+    if conv2d:
+        weight = weight.reshape(out_dim, in_dim, kernel_size[0], kernel_size[1])
+    else:
+        weight = weight.reshape(out_dim, in_dim)
+
+    return weight
+
+
+def calc_lora(mat, new_rank, new_conv_rank):
+    conv2d = len(mat.size()) == 4
+    kernel_size = None if not conv2d else mat.size()[2:4]
+    conv2d_3x3 = conv2d and kernel_size != (1, 1)
+    out_dim, in_dim = mat.size()[0:2]
+
+    if conv2d:
+        if conv2d_3x3:
+            mat = mat.flatten(start_dim=1)
+        else:
+            mat = mat.squeeze()
+
+    module_new_rank = new_conv_rank if conv2d_3x3 else new_rank
+    module_new_rank = min(module_new_rank, in_dim, out_dim)  # LoRA rank cannot exceed the original dim
+
+    U, S, Vh = torch.linalg.svd(mat)
+
+    U = U[:, :module_new_rank]
+    S = S[:module_new_rank]
+    U = U @ torch.diag(S)
+
+    Vh = Vh[:module_new_rank, :]
+
+    dist = torch.cat([U.flatten(), Vh.flatten()])
+    hi_val = torch.quantile(dist, CLAMP_QUANTILE)
+    low_val = -hi_val
+
+    U = U.clamp(low_val, hi_val)
+    Vh = Vh.clamp(low_val, hi_val)
+
+    if conv2d:
+        U = U.reshape(out_dim, module_new_rank, 1, 1)
+        Vh = Vh.reshape(module_new_rank, in_dim, kernel_size[0], kernel_size[1])
+
+    up_weight = U
+    down_weight = Vh
+
+    return up_weight, down_weight, torch.tensor(module_new_rank)
 
 
 def merge(args):
