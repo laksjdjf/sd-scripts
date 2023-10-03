@@ -170,15 +170,17 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             base_alpha = base_alphas[lora_module_name]
             alpha = alphas[lora_module_name]
 
-            scale = math.sqrt(alpha / base_alpha) * ratio
-            scale = abs(scale) if "lora_up" in key else scale # マイナスの重みに対応する。
+            scale = math.sqrt(alpha / base_alpha * abs(ratio)) # どうすればいいんだ？
+            scale = -scale if ("lora_up" in key and ratio < 0) else scale # マイナスの重みに対応する。
 
             if key in merged_sd:
                 assert (
                     merged_sd[key].size() == lora_sd[key].size() or concat_dim is not None
                 ), f"weights shape mismatch merging v1 and v2, different dims? / 重みのサイズが合いません。v1とv2、または次元数の異なるモデルはマージできません"
                 if concat_dim is not None:
-                    merged_sd[key] = torch.cat([merged_sd[key], lora_sd[key] * scale], dim=concat_dim)
+                    org_rank = merged_sd[key].size()[concat_dim]
+                    merged_rank = org_rank + lora_sd[key].size()[concat_dim]
+                    merged_sd[key] = torch.cat([merged_sd[key], lora_sd[key] * scale], dim=concat_dim) * math.sqrt((merged_rank / org_rank))
                 else:
                     merged_sd[key] = merged_sd[key] + lora_sd[key] * scale
             else:
